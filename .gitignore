@@ -1,0 +1,6 @@
+# Never commit API keys or local secrets
+.env
+
+# Never commit local Python virtual environments
+venv/
+__pycache__/
