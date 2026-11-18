@@ -1,6 +1,23 @@
-# Never commit API keys or local secrets
+# Security & Credentials
 .env
+*.pem
+*.key
+*.p12
 
-# Never commit local Python virtual environments
-venv/
+# Python Environment & Bytecode
 __pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Operating System Garbage
+.DS_Store
+Thumbs.db
+
+# Docker Persistent Volumes Data
+postgres_data/
