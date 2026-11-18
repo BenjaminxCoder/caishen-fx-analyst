@@ -8,6 +8,7 @@
 import os
 import json
 import requests
+import psycopg
 from dotenv import load_dotenv
 
 # 1. Load environment variables from your local .env file
@@ -16,12 +17,52 @@ load_dotenv()
 API_TOKEN = os.getenv("OANDA_API_TOKEN")
 ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 STREAM_URL = os.getenv("OANDA_STREAM_URL")
+DB_URL = os.getenv("DATABASE_URL")
 
 url = f"{STREAM_URL}/v3/accounts/{ACCOUNT_ID}/transactions/stream"
 headers = {
     "Authorization": f"Bearer {API_TOKEN}",
     "Content-Type": "application/json",
 }
+
+def save_opened_trade(event):
+    """Inserts a newly opened OANDA trade into PostgreSQL and flags missing pre-trade plans."""
+    trade_opened = event.get("tradeOpened")
+    if not trade_opened:
+        return  # Skip closing fills for now; we will handle tradesClosed on Day 2!
+
+    oanda_trade_id = trade_opened["tradeID"]
+    instrument = event["instrument"]
+    units = event["units"]
+    entry_price = event["price"]
+    half_spread = event.get("halfSpreadCost", "0")
+    opened_at = event["time"]
+
+    # Using 'with' ensures the DB connection closes and commits atomically
+    with psycopg.connect(DB_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO trades (oanda_trade_id, instrument, units, entry_price, half_spread_cost, opened_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (oanda_trade_id) DO NOTHING
+                RETURNING id;
+                """,
+                (oanda_trade_id, instrument, units, entry_price, half_spread, opened_at),
+            )
+            row = cur.fetchone()
+
+            # If a brand-new trade row was inserted (not a duplicate), check Rule 2 (Pre-Trade Plan)
+            if row:
+                new_trade_id = row[0]
+                cur.execute(
+                    """
+                    INSERT INTO rule_violations (trade_id, violation_type, severity, ai_debrief)
+                    VALUES (%s, 'NO_PRE_TRADE_PLAN', 'WARNING', 'Trade opened without a logged pre-trade thesis.');
+                    """,
+                    (new_trade_id,),
+                )
+                print(f"[DB SAVED] Trade #{new_trade_id} (OANDA ID {oanda_trade_id}) logged + Rule 2 warning recorded.")
 
 def start_stream():
     print(f"Connecting to OANDA stream for {ACCOUNT_ID}...")
@@ -38,6 +79,9 @@ def start_stream():
 
                 if event_type == "HEARTBEAT":
                     print(f"[HEARTBEAT] {event.get('time')}")
+                elif event_type == "ORDER_FILL":
+                 print(f"\n>>> ORDER_FILL DETECTED <<<")
+                 save_opened_trade(event)
                 else:
                     print(f"\n>>> TRANSACTION EVENT: {event_type} <<<")
                     print(json.dumps(event, indent=2))
