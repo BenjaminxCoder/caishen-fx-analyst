@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: local_dev_password
       POSTGRES_DB: caishen_ledger
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
