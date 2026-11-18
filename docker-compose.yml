@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: caishen_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: caishen_admin
+      POSTGRES_PASSWORD: local_dev_password
+      POSTGRES_DB: caishen_ledger
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
