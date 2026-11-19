@@ -64,6 +64,53 @@ def save_opened_trade(event):
                 )
                 print(f"[DB SAVED] Trade #{new_trade_id} (OANDA ID {oanda_trade_id}) logged + Rule 2 warning recorded.")
 
+def save_closed_trades(event):
+    # Safe retieve the list of closed trades from the OANDA event dict Using .get(..., []) pervents a KeyError crash.
+    closed_trades = event.get("tradesClosed", [])
+
+    # Exit the function immediately if the list is empty; Guard clause pattern-avoids.
+    if not closed_trades:
+        return
+
+    exit_price = event["price"]
+    closed_at = event["time"]
+    close_reason = event.get("reason", "UNKNOWN")
+
+    # Open an atomic self-closing PostgreSQL db Connection
+    # The 'with' context manager guarantees the transaction commits if all updates succeed, or rolls back if an error occurs.
+    with psycopg.connect(DB_URL) as conn:
+        # Open a database cursor to execute parameterized SQL statements; Cursors isolate query execution and prevent SQL injection by safely binding %s placeholders.
+        with conn.cursor() as cur:
+            # Loop through every closed trade dict inside tradesClosed list; A single closing order can close mulitple open trades.
+            for closed_item in closed_trades:
+                # Extract the original OANDA trade ID and the realized profit/loss for this specific ticket.
+                oanda_trade_id = closed_item["tradeID"]
+                realized_pl = closed_item["realizedPL"]
+
+                # Update the existing open trade record with its closing metrics; The WHERE clause ensures we only modify this exact trade ticket rather than overwriting the entire ledger.
+                cur.execute(
+                    """
+                    UPDATE trades
+                    SET exit_price = %s,
+                        realized_pl = %s,
+                        close_reason = %s,
+                        closed_at = %s
+                    WHERE oanda_trade_id = %s
+                    RETURNING id, instrument;
+                    """,
+                    (exit_price, realized_pl, close_reason, closed_at, oanda_trade_id),
+                )
+
+                # Fetch the returned database primary key (id) and currency pair if a row matched.
+                updated_row = cur.fetchone()
+
+                if updated_row:
+                    db_id, instrument = updated_row
+                    print(f"[DB CLOSED] Trade #{db_id} ({instrument} | OANDA ID {oanda_trade_id}) closed | P/L: {realized_pl} | Reason: {close_reason}")
+                else:
+                    # Log a warning if PostgreSQL updated 0 rows; Handles the edge case where a trade was opened while our Python listener was offline.
+                    print(f"[DB WARN] Received close for OANDA ID {oanda_trade_id}, but no matching open trade exists in Postgres.")
+
 def start_stream():
     print(f"Connecting to OANDA stream for {ACCOUNT_ID}...")
 
@@ -82,6 +129,7 @@ def start_stream():
                 elif event_type == "ORDER_FILL":
                  print(f"\n>>> ORDER_FILL DETECTED <<<")
                  save_opened_trade(event)
+                 save_closed_trades(event)
                 else:
                     print(f"\n>>> TRANSACTION EVENT: {event_type} <<<")
                     print(json.dumps(event, indent=2))
