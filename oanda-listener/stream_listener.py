@@ -3,11 +3,14 @@
 # import json: loads Python's built-in JSON (JavaScript Object Notation) module.
 # import requests: loads the popular third-party Requests library into your script;
 #   enabling your code to send HTTP requests and interact with websites or APIs. 
+# import decimal: for exact base-10 financial arithmetic;
+#   Standard Python floats introduce rounding errors in ledger and drawdown math.
 # from dotenv import load_dotenv: Let's us keep our API keys or Tokens safe from leaking.
 ###
 import os
 import json
 import requests
+from decimal import Decimal
 import psycopg
 from dotenv import load_dotenv
 
@@ -111,6 +114,80 @@ def save_closed_trades(event):
                     # Log a warning if PostgreSQL updated 0 rows; Handles the edge case where a trade was opened while our Python listener was offline.
                     print(f"[DB WARN] Received close for OANDA ID {oanda_trade_id}, but no matching open trade exists in Postgres.")
 
+def update_account_governance(event):
+    # Extract OANDA's post-fill account balance string from the ORDER_FILLED payload.
+    raw_balance = event.get("accountBalance")
+
+    # Guard clause to exit safely if an event ever omits 'accountBalance'; Prevents a TypeError when converting None to Decimal.
+    current_balance = Decimal(raw_balance)
+
+    # open an atomic PostgreSQL transaction; Ensures balance updates, status transitions, and violation logs commit together as one indivisible unit.
+    with psycopg.connect(DB_URL) as conn:
+        with conn.cursor() as cur:
+            # Bootstrap the account_states row if this is the very first event ever recorded; Solves the cold-start empty table problem.
+            cur.execute(
+                """
+                INSERT INTO account_states (oanda_account_id, weekly_starting_balance, current_balance)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (oanda_account_id) DO NOTHING;
+                """,
+                (ACCOUNT_ID, current_balance, current_balance),
+            )
+
+            # Fetch the stored weekly starting balance and current governance status for this account.
+            cur.execute(
+                """
+                SELECT weekly_starting_balance, status
+                FROM account_states
+                WHERE oanda_account_id = %s;
+                """,
+                (ACCOUNT_ID,),
+            )
+            weekly_start, current_status = cur.fetchone()
+
+            # Compute weekly drawdown ratio; negative means profitable week
+            drawdown_ratio = (weekly_start - current_balance) / weekly_start
+            drawdown_pct = (drawdown_ratio * Decimal("100")).quantize(Decimal("0.01"))
+
+            # Check if weekly drawdown has hit or exceeded 10% (0.10) while the account is still ACTIVE;
+            # Enforces Rule 3 by transitioning the account to SUSPENDED with a 23h 59m cooldown and logging a LOCKOUT violation.
+            if drawdown_ratio >= Decimal("0.10") and current_status == "ACTIVE":
+                cur.execute(
+                    """
+                    UPDATE account_states
+                    SET current_balance = %s,
+                        suspended_until = NOW() + INTERVAL '23 hours 59 minutes',
+                        updated_at = NOW()
+                    WHERE oanda_account_id = %s;
+                    """,
+                    (current_balance, ACCOUNT_ID),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO rule_violations (violation_type, severity, ai_debrief)
+                    VALUES (
+                        'WEEKLY_DRAWDOWN_10PCT',
+                        'LOCKOUT',
+                        %s
+                    );
+                    """,
+                    (f"Account suspended: weekly drawdown reached {drawdown_pct}% (Start: {weekly_start}, Current: {current_balance}).",),
+                )
+                print(f"[LOCKOUT TRIGGERED] Drawdown {drawdown_pct}% breached 10% limit! Account SUSPENDED for 23h 59m.")
+            else:
+                # Update only the current_balance and timestamp when within safe risk limits.
+                # Keeps the ledger's live balance synchronized without altering an existing status.
+                cur.execute(
+                    """
+                    UPDATE account_states
+                    SET current_balance = %s,
+                        updated_at = NOW()
+                    WHERE oanda_account_id = %s;
+                    """,
+                    (current_balance, ACCOUNT_ID),
+                )
+                print(f"[GOVERNANCE] Balance: {current_balance} | Weekly Start: {weekly_start} | Drawdown: {drawdown_pct}% | Status: {current_status}")
+
 def start_stream():
     print(f"Connecting to OANDA stream for {ACCOUNT_ID}...")
 
@@ -130,6 +207,7 @@ def start_stream():
                  print(f"\n>>> ORDER_FILL DETECTED <<<")
                  save_opened_trade(event)
                  save_closed_trades(event)
+                 update_account_governance(event)
                 else:
                     print(f"\n>>> TRANSACTION EVENT: {event_type} <<<")
                     print(json.dumps(event, indent=2))
